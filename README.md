@@ -30,6 +30,8 @@ Needs Python for Windows (python.org, includes Tk). The installer adds **Claude 
 
 ### Native Ubuntu
 
+Step-by-step guide, including autostart and Wayland setup: **[docs/UBUNTU.md](docs/UBUNTU.md)**. In short:
+
 ```bash
 sudo apt install python3-tk tmux   # Tk for the window
 python3 install.py

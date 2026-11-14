@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -150,6 +151,31 @@ class LifecycleTests(HookTestCase):
             self.fire("SessionStart")
         self.assertNotIn("tmux_pane", self.status())
 
+    def test_prompt_records_turn_start(self):
+        with mock.patch.object(hook.time, "time", return_value=1000.0):
+            self.fire("UserPromptSubmit", prompt="go")
+        with mock.patch.object(hook.time, "time", return_value=1500.0):
+            self.fire("PreToolUse", tool_name="Bash", tool_input={})
+        s = self.status()
+        self.assertEqual(s["turn_started_at"], 1000.0)
+        self.assertEqual(s["updated_at"], 1500.0)
+
+    def test_subagents_are_counted_by_id(self):
+        self.fire("UserPromptSubmit", prompt="go")
+        self.fire("SubagentStart", agent_id="a1", agent_type="Explore")
+        self.fire("SubagentStart", agent_id="a2", agent_type="Plan")
+        self.fire("SubagentStart", agent_id="a2", agent_type="Plan")  # duplicate event
+        self.assertEqual(self.status()["subagents"], ["a1", "a2"])
+        self.fire("SubagentStop", agent_id="a1")
+        self.fire("SubagentStop", agent_id="unknown")
+        self.assertEqual(self.status()["subagents"], ["a2"])
+        self.assertEqual(self.status()["state"], "working")
+
+    def test_session_start_resets_subagents(self):
+        self.fire("SubagentStart", agent_id="a1")
+        self.fire("SessionStart", source="resume")
+        self.assertEqual(self.status()["subagents"], [])
+
     def test_session_end_removes_file(self):
         self.fire("SessionStart")
         self.fire("SessionEnd", reason="exit")
@@ -187,6 +213,13 @@ class RobustnessTests(HookTestCase):
         self.fire("SessionStart")
         self.fire("UserPromptSubmit", prompt="x")
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["s1.json"])
+
+    def test_sessions_without_pid_are_pruned_when_stale(self):
+        old = time.time() - 2 * 86400
+        (self.dir / "old.json").write_text(json.dumps({"session_id": "old", "pid": None, "updated_at": old}))
+        (self.dir / "fresh.json").write_text(json.dumps({"session_id": "fresh", "pid": None, "updated_at": time.time()}))
+        self.fire("SessionStart")
+        self.assertEqual(sorted(p.name for p in self.dir.glob("*.json")), ["fresh.json", "s1.json"])
 
     def test_dead_sessions_are_pruned(self):
         (self.dir / "dead.json").write_text(json.dumps({"session_id": "dead", "pid": 999999999, "pid_start": "1"}))

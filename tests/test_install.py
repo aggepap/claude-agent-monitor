@@ -10,7 +10,8 @@ APP = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP))
 import install  # noqa: E402
 
-EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "SessionEnd"]
+EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "SessionEnd",
+          "SubagentStart", "SubagentStop"]
 
 
 def commands(settings, event):
@@ -48,6 +49,12 @@ class HookSettingsTests(unittest.TestCase):
         out = install.remove_hooks(settings)
         self.assertEqual(commands(out, "SessionStart"), ["python3 /opt/other-tool/notify.sh"])
         self.assertNotIn("PreToolUse", out["hooks"])
+
+    def test_hook_command_with_explicit_python_quotes_it(self):
+        self.assertEqual(
+            install.hook_command(Path("/c/apps/cam"), python="C:/Program Files/Python312/python.exe"),
+            '"C:/Program Files/Python312/python.exe" "/c/apps/cam/hook.py" # claude-agent-monitor',
+        )
 
     def test_hook_command_quotes_path(self):
         self.assertEqual(install.hook_command(Path("/my apps/cam")), 'python3 "/my apps/cam/hook.py" # claude-agent-monitor')
@@ -122,6 +129,45 @@ class LinuxInstallTests(unittest.TestCase):
         (self.home / ".claude" / "settings.json").write_text("{not json")
         self.assertNotEqual(install.main(["install"]), 0)
         self.assertEqual((self.home / ".claude" / "settings.json").read_text(), "{not json")
+
+
+class NativeWindowsInstallTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.scripts = []
+        patches = [
+            mock.patch.dict(os.environ, {"HOME": str(self.home)}),
+            mock.patch.object(install, "platform_kind", return_value="windows"),
+            mock.patch.object(install, "windows_python", return_value=("C:/Py/python.exe", "C:/Py/pythonw.exe")),
+            mock.patch.object(install, "_ps", side_effect=self.fake_ps),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def fake_ps(self, script):
+        self.scripts.append(script)
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_install_registers_windows_python_hook_and_local_shortcut(self):
+        self.assertEqual(install.main(["install"]), 0)
+        settings = json.loads((self.home / ".claude" / "settings.json").read_text())
+        cmd = commands(settings, "Stop")[0]
+        self.assertTrue(cmd.startswith('"C:/Py/python.exe" "'), cmd)
+        self.assertTrue(cmd.endswith('hook.py" # claude-agent-monitor'), cmd)
+        script = self.scripts[-1]
+        self.assertIn("C:/Py/pythonw.exe", script)
+        self.assertIn("monitor.pyw", script)
+        self.assertNotIn("--sessions", script)
+
+    def test_uninstall_removes_shortcuts(self):
+        install.main(["install"])
+        self.assertEqual(install.main(["uninstall"]), 0)
+        self.assertIn("Remove-Item", self.scripts[-1])
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 """Claude Code hook: record each session's state for the floating agent monitor.
 
 Registered for SessionStart, UserPromptSubmit, PreToolUse, PostToolUse,
-Notification, Stop and SessionEnd (install.py does that). Writes
+Notification, Stop, SessionEnd, SubagentStart and SubagentStop (install.py does that). Writes
 ~/.claude/agent-monitor/sessions/<session_id>.json. Never prints and always
 exits 0 so it cannot disturb Claude.
 """
@@ -138,13 +138,27 @@ def save(path, data):
     os.replace(tmp, path)
 
 
+STALE_AFTER = 24 * 3600
+
+
+def is_dead(data, now):
+    """Process gone (checked via /proc), or, where that can't be checked
+    (e.g. native Windows), no activity for a day."""
+    pid, start = data.get("pid"), data.get("pid_start")
+    if isinstance(pid, int) and start is not None:
+        return proc_starttime(pid) != start
+    try:
+        return now - float(data.get("updated_at") or 0) > STALE_AFTER
+    except (TypeError, ValueError):
+        return True
+
+
 def prune_dead(status_dir, keep):
+    now = time.time()
     for path in status_dir.glob("*.json"):
         if path.name == keep:
             continue
-        data = load(path)
-        pid = data.get("pid")
-        if isinstance(pid, int) and proc_starttime(pid) != data.get("pid_start"):
+        if is_dead(load(path), now):
             try:
                 path.unlink()
             except OSError:
@@ -152,10 +166,17 @@ def prune_dead(status_dir, keep):
 
 
 def apply_event(status, event, payload):
+    agents = [a for a in status.get("subagents", []) if isinstance(a, str)]
+    agent_id = str(payload.get("agent_id") or "")
     if event == "SessionStart":
-        status.update(state="idle", message="", activity="")
+        status.update(state="idle", message="", activity="", subagents=[])
     elif event == "UserPromptSubmit":
-        status.update(state="working", task=snippet(payload.get("prompt")), activity="", message="", summary="")
+        status.update(state="working", task=snippet(payload.get("prompt")), activity="", message="", summary="",
+                      turn_started_at=time.time())
+    elif event == "SubagentStart":
+        status["subagents"] = agents + ([agent_id] if agent_id and agent_id not in agents else [])
+    elif event == "SubagentStop":
+        status["subagents"] = [a for a in agents if a != agent_id]
     elif event == "PreToolUse":
         tool, tool_input = str(payload.get("tool_name") or "tool"), payload.get("tool_input")
         if tool == "AskUserQuestion":

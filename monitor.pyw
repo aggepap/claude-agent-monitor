@@ -4,8 +4,8 @@ Linux:    python3 monitor.pyw
 Windows:  pythonw.exe monitor.pyw --sessions \\\\wsl.localhost\\<distro>\\home\\<you>\\.claude\\agent-monitor\\sessions
 (install.py creates these launchers for you.)
 
-Drag the header to move · double-click it to collapse · right-click for menu.
-Click a session card to jump to its terminal (Windows Terminal, tmux, VS Code,
+Drag the header to move · double-click it to collapse · right-click for the
+menu (Settings…). Right-click a card to dismiss it. Click a card to jump to its terminal (Windows Terminal, tmux, VS Code,
 X11 windows via wmctrl, GNOME Wayland via the "Activate Window By Title" extension).
 """
 import json
@@ -179,6 +179,107 @@ def counts_summary(sessions):
     return " · ".join(parts)
 
 
+DEFAULT_PREFS = {
+    "x": 40, "y": 40, "collapsed": False, "alpha": 0.95,
+    "notify_waiting": False,  # desktop notification when a session needs you
+    "notify_done": False,     # desktop notification when a session finishes
+    "sound": True, "flash": True, "hide_done": False, "quiet_minutes": 10,
+}
+
+
+def load_prefs(path):
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = {}
+    raw = raw if isinstance(raw, dict) else {}
+    prefs = dict(DEFAULT_PREFS)
+    for key, default in DEFAULT_PREFS.items():
+        value = raw.get(key)
+        if isinstance(default, bool):
+            if isinstance(value, bool):
+                prefs[key] = value
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            prefs[key] = value
+    prefs["alpha"] = min(1.0, max(0.3, float(prefs["alpha"])))
+    prefs["quiet_minutes"] = int(min(240, max(1, prefs["quiet_minutes"])))
+    prefs["x"], prefs["y"] = int(prefs["x"]), int(prefs["y"])
+    return prefs
+
+
+def save_prefs(path, prefs):
+    try:
+        Path(path).write_text(json.dumps(prefs), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def top_state(sessions):
+    states = [s.get("state") for s in sessions if s.get("state") in STATE_ORDER]
+    return min(states, key=STATE_ORDER.get) if states else None
+
+
+def card_time(s, now):
+    if s.get("state") in ("working", "waiting"):
+        return format_age(s.get("turn_started_at") or s.get("updated_at"), now)
+    age = format_age(s.get("updated_at"), now)
+    return f"{age} ago" if age else ""
+
+
+def is_quiet(s, now, minutes):
+    updated = s.get("updated_at")
+    return s.get("state") == "working" and bool(updated) and now - float(updated) > minutes * 60
+
+
+def visible_sessions(sessions, prefs, dismissed):
+    return [
+        s for s in sessions
+        if not (prefs.get("hide_done") and s.get("state") == "done")
+        and dismissed.get(s.get("session_id")) != s.get("updated_at")
+    ]
+
+
+def transitions(prev, sessions):
+    """Sessions that just started waiting / just finished, since the last poll."""
+    if prev is None:
+        return [], []
+    waiting = [s for s in sessions if s.get("state") == "waiting" and prev.get(s.get("session_id")) != "waiting"]
+    done = [s for s in sessions if s.get("state") == "done" and prev.get(s.get("session_id")) not in (None, "done")]
+    return waiting, done
+
+
+def notification_text(s):
+    project = s.get("project") or "Claude"
+    if s.get("state") == "waiting":
+        return f"{project} needs you", s.get("message") or "Waiting for your input"
+    return f"{project} finished", s.get("summary") or "Done"
+
+
+# Text arrives through environment variables, never through the script itself.
+TOAST_PS = r"""
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$t = $x.GetElementsByTagName('text')
+$t.Item(0).AppendChild($x.CreateTextNode($env:CAM_TITLE)) > $null
+$t.Item(1).AppendChild($x.CreateTextNode($env:CAM_BODY)) > $null
+$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show([Windows.UI.Notifications.ToastNotification]::new($x))
+"""
+
+
+def notify_command(platform, title, body):
+    """(argv, extra_env) for a desktop notification. Text is never parsed by a shell."""
+    if platform == "win32":
+        return ([system_exe("powershell.exe"), "-NoProfile", "-NonInteractive", "-Command", TOAST_PS],
+                {"CAM_TITLE": title, "CAM_BODY": body})
+    return (["notify-send", "-a", "Claude Agent Monitor", "-i", "utilities-system-monitor", "-A", "open=Open", title, body], {})
+
+
+def subagent_label(s):
+    n = len(s.get("subagents") or [])
+    return f"+{n} agent{'s' if n != 1 else ''}" if n else ""
+
+
 # ---------- focusing a session's terminal ----------
 
 # Lists Windows Terminal tabs + other top-level windows as JSON, then reads the
@@ -287,6 +388,35 @@ def focus_windows(session):
     return ""
 
 
+# ---------- desktop notifications ----------
+
+def send_notification(session, on_open):
+    """Fire-and-forget; on Linux, clicking "Open" jumps to the terminal."""
+    import shutil
+    import subprocess
+    title, body = notification_text(session)
+    argv, extra = notify_command(sys.platform, title, body)
+
+    def work():
+        try:
+            if IS_WINDOWS:
+                subprocess.run(argv, env={**os.environ, **extra}, capture_output=True, timeout=15,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                return
+            if not shutil.which("notify-send"):
+                return
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=600)
+            if r.returncode != 0:  # older notify-send without actions (-A)
+                plain = [a for a in argv if a not in ("-A", "open=Open")]
+                subprocess.run(plain, capture_output=True, timeout=15)
+            elif r.stdout.strip() == "open":
+                on_open()
+        except Exception:
+            log_error()
+
+    threading.Thread(target=work, daemon=True).start()
+
+
 # ---------- view ----------
 
 def main():
@@ -299,19 +429,14 @@ def main():
         except Exception:
             pass
 
-    prefs = {}
-    try:
-        prefs = json.loads(PREFS.read_text())
-    except (OSError, ValueError):
-        pass
-
+    prefs = load_prefs(PREFS)
     root = tk.Tk()
     root.title("Claude agents")
     root.overrideredirect(True)
     root.attributes("-topmost", True)
-    root.attributes("-alpha", prefs.get("alpha", 0.95))
+    root.attributes("-alpha", prefs["alpha"])
     root.configure(bg=BG)
-    root.geometry(f"+{prefs.get('x', 40)}+{prefs.get('y', 40)}")
+    root.geometry(f"+{prefs['x']}+{prefs['y']}")
 
     width = 380
     family = "Segoe UI" if IS_WINDOWS else "Ubuntu"
@@ -319,26 +444,28 @@ def main():
     bold = ("Segoe UI Semibold", 9) if IS_WINDOWS else (family, 9, "bold")
     small = (family, 8)
     tiny_bold = ("Segoe UI Semibold", 8) if IS_WINDOWS else (family, 8, "bold")
-    ui = {"collapsed": prefs.get("collapsed", False), "sig": None, "prev": {}, "ages": [], "notice": ("", 0)}
+    ui = {"sig": None, "prev": None, "times": [], "notice": ("", 0), "dismissed": {}, "settings": None}
 
     header = tk.Frame(root, bg=HEADER, width=width)
     header.pack(fill="x")
-    title = tk.Label(header, text="◆ Claude agents", bg=HEADER, fg=FG, font=bold, padx=10, pady=6)
+    diamond = tk.Label(header, text="◆", bg=HEADER, fg=MUTED, font=bold, padx=0)
+    diamond.pack(side="left", padx=(10, 4))
+    title = tk.Label(header, text="Claude agents", bg=HEADER, fg=FG, font=bold, pady=6)
     title.pack(side="left")
     close = tk.Label(header, text="✕", bg=HEADER, fg=MUTED, font=bold, padx=10, cursor="hand2")
     close.pack(side="right")
     summary = tk.Label(header, text="", bg=HEADER, fg=MUTED, font=small)
     summary.pack(side="right")
+    state_bar = tk.Frame(root, bg=HEADER, height=3)  # colour of the most urgent session
+    state_bar.pack(fill="x")
     body = tk.Frame(root, bg=BG, width=width)
 
-    def save_prefs():
-        try:
-            PREFS.write_text(json.dumps({"x": root.winfo_x(), "y": root.winfo_y(), "collapsed": ui["collapsed"], "alpha": root.attributes("-alpha")}))
-        except OSError:
-            pass
+    def persist():
+        prefs.update(x=root.winfo_x(), y=root.winfo_y(), alpha=float(root.attributes("-alpha")))
+        save_prefs(PREFS, prefs)
 
     def quit_app(_=None):
-        save_prefs()
+        persist()
         root.destroy()
 
     drag = {}
@@ -350,34 +477,94 @@ def main():
         root.geometry(f"+{e.x_root - drag['x']}+{e.y_root - drag['y']}")
 
     def toggle(_=None):
-        ui["collapsed"] = not ui["collapsed"]
-        body.pack_forget() if ui["collapsed"] else body.pack(fill="both")
-        save_prefs()
+        prefs["collapsed"] = not prefs["collapsed"]
+        body.pack_forget() if prefs["collapsed"] else body.pack(fill="both")
+        persist()
+
+    def open_settings():
+        if ui["settings"] is not None and ui["settings"].winfo_exists():
+            ui["settings"].lift()
+            return
+        win = tk.Toplevel(root, bg=BG, padx=14, pady=12)
+        ui["settings"] = win
+        win.title("Claude agents · Settings")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+
+        def section(text):
+            tk.Label(win, text=text, bg=BG, fg=MUTED, font=tiny_bold, anchor="w").pack(fill="x", pady=(8, 2))
+
+        def check(key, text):
+            var = tk.BooleanVar(value=prefs[key])
+
+            def changed():
+                prefs[key] = var.get()
+                ui["sig"] = None  # re-render (e.g. hide finished)
+                persist()
+
+            tk.Checkbutton(win, text=text, variable=var, command=changed, bg=BG, fg=FG, selectcolor=CARD,
+                           activebackground=BG, activeforeground=FG, font=font, anchor="w").pack(fill="x")
+
+        section("NOTIFICATIONS")
+        check("notify_waiting", "Desktop notification when a session needs me")
+        check("notify_done", "Desktop notification when a session finishes")
+        tk.Button(win, text="Send a test notification", font=small, bg=CARD, fg=FG, relief="flat",
+                  activebackground=CARD_HOT, activeforeground=FG,
+                  command=lambda: send_notification({"state": "waiting", "project": "Test", "message": "Notifications are working."}, lambda: None),
+                  ).pack(anchor="w", pady=(4, 0))
+        section("WHEN A SESSION NEEDS ME")
+        check("sound", "Play a sound")
+        check("flash", "Flash the header")
+        section("LIST")
+        check("hide_done", "Hide finished sessions")
+        row = tk.Frame(win, bg=BG)
+        row.pack(fill="x", pady=(2, 0))
+        tk.Label(row, text="Mark as quiet after", bg=BG, fg=FG, font=font).pack(side="left")
+        minutes = tk.IntVar(value=prefs["quiet_minutes"])
+
+        def minutes_changed(*_):
+            try:
+                prefs["quiet_minutes"] = max(1, min(240, int(minutes.get())))
+            except (tk.TclError, ValueError):
+                return
+            ui["sig"] = None
+            persist()
+
+        tk.Spinbox(row, from_=1, to=240, width=4, textvariable=minutes, command=minutes_changed, font=font,
+                   bg=CARD, fg=FG, buttonbackground=CARD, insertbackground=FG, relief="flat").pack(side="left", padx=6)
+        minutes.trace_add("write", minutes_changed)
+        tk.Label(row, text="minutes without activity", bg=BG, fg=FG, font=font).pack(side="left")
+        section("WINDOW")
+        level = tk.IntVar(value=int(round(prefs["alpha"] * 100)))  # set before command: opening changes nothing
+        tk.Scale(win, from_=40, to=100, resolution=5, variable=level, orient="horizontal", label="Opacity %",
+                 bg=BG, fg=FG, font=small, troughcolor=CARD, highlightthickness=0, showvalue=True, length=260,
+                 command=lambda v: (root.attributes("-alpha", float(v) / 100), persist())).pack(anchor="w")
+        tk.Button(win, text="Close", command=win.destroy, font=font, bg=CARD, fg=FG, relief="flat",
+                  activebackground=CARD_HOT, activeforeground=FG, padx=12).pack(anchor="e", pady=(10, 0))
+        win.update_idletasks()
+        win.geometry(f"+{max(0, root.winfo_x() - 20)}+{root.winfo_y() + 40}")
 
     menu = tk.Menu(root, tearoff=0)
+    menu.add_command(label="Settings…", command=open_settings)
     menu.add_command(label="Collapse / expand", command=toggle)
-    menu.add_command(label="Opacity 100%", command=lambda: root.attributes("-alpha", 1.0))
-    menu.add_command(label="Opacity 80%", command=lambda: root.attributes("-alpha", 0.8))
+    menu.add_command(label="Show dismissed sessions", command=lambda: (ui["dismissed"].clear(), ui.update(sig=None)))
     menu.add_separator()
     menu.add_command(label="Quit", command=quit_app)
 
-    for w in (header, title, summary):
+    for w in (header, diamond, title, summary):
         w.bind("<Button-1>", start_drag)
         w.bind("<B1-Motion>", do_drag)
-        w.bind("<ButtonRelease-1>", lambda e: save_prefs())
+        w.bind("<ButtonRelease-1>", lambda e: persist())
         w.bind("<Double-Button-1>", toggle)
         w.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
     close.bind("<Button-1>", quit_app)
 
     def flash(times=6):
-        if times <= 0:
-            title.configure(bg=HEADER)
-            header.configure(bg=HEADER)
-            return
         colour = STATE_STYLE["waiting"][1] if times % 2 else HEADER
-        title.configure(bg=colour)
-        header.configure(bg=colour)
-        root.after(250, flash, times - 1)
+        for w in (header, diamond, title, summary):
+            w.configure(bg=HEADER if times <= 0 else colour)
+        if times > 0:
+            root.after(250, flash, times - 1)
 
     def open_terminal(session):
         ui["notice"] = ("opening…", time.time() + 5)
@@ -392,22 +579,35 @@ def main():
 
         threading.Thread(target=work, daemon=True).start()
 
-    def bind_click(widget, session):
+    def dismiss(session):
+        ui["dismissed"][session.get("session_id")] = session.get("updated_at")
+        ui["sig"] = None
+
+    def bind_card(widget, session):
         widget.configure(cursor="hand2")
         widget.bind("<Button-1>", lambda e: open_terminal(session))
+        widget.bind("<Button-3>", lambda e: card_menu(e, session))
         for child in widget.winfo_children():
-            bind_click(child, session)
+            bind_card(child, session)
 
-    def render(sessions):
+    def card_menu(event, session):
+        m = tk.Menu(root, tearoff=0)
+        m.add_command(label="Open terminal", command=lambda: open_terminal(session))
+        m.add_command(label="Dismiss", command=lambda: dismiss(session))
+        m.tk_popup(event.x_root, event.y_root)
+
+    def render(sessions, now):
         for child in body.winfo_children():
             child.destroy()
-        ui["ages"] = []
+        ui["times"] = []
         if not sessions:
             tk.Label(body, text="No Claude Code sessions running", bg=BG, fg=MUTED, font=font, pady=14).pack(fill="x")
             return
         for s in sessions[:15]:
-            label, accent = STATE_STYLE.get(s.get("state"), ("?", MUTED))
+            quiet = is_quiet(s, now, prefs["quiet_minutes"])
+            label, accent = ("QUIET?", MUTED) if quiet else STATE_STYLE.get(s.get("state"), ("?", MUTED))
             card_bg = CARD_HOT if s.get("state") == "waiting" else CARD
+            text_fg = MUTED if quiet else FG
             card = tk.Frame(body, bg=card_bg)
             card.pack(fill="x", padx=6, pady=(6, 0))
             tk.Frame(card, bg=accent, width=4).pack(side="left", fill="y")
@@ -419,28 +619,27 @@ def main():
             heading = s.get("custom_title") or s.get("title")
             if heading:
                 name = f"{name} · {heading}"
-            tk.Label(top, text=name[:48] + ("…" if len(name) > 48 else ""), bg=card_bg, fg=FG, font=bold).pack(side="left")
-            age = tk.Label(top, text="", bg=card_bg, fg=MUTED, font=small)
-            age.pack(side="right")
-            ui["ages"].append((age, s.get("updated_at")))
+            tk.Label(top, text=name[:44] + ("…" if len(name) > 44 else ""), bg=card_bg, fg=text_fg, font=bold).pack(side="left")
+            when = tk.Label(top, text=card_time(s, now), bg=card_bg, fg=MUTED, font=small)
+            when.pack(side="right")
+            ui["times"].append((when, s))
             tk.Label(top, text=label, bg=card_bg, fg=accent, font=tiny_bold).pack(side="right", padx=6)
+            agents = subagent_label(s)
+            if agents:
+                tk.Label(top, text=agents, bg=card_bg, fg=STATE_STYLE["working"][1], font=small).pack(side="right")
             detail = detail_line(s)
             if detail:
-                tk.Label(inner, text=detail, bg=card_bg, fg=FG, font=font, anchor="w", justify="left", wraplength=width - 40).pack(fill="x")
+                tk.Label(inner, text=detail, bg=card_bg, fg=text_fg, font=font, anchor="w", justify="left", wraplength=width - 40).pack(fill="x")
             if s.get("task"):
                 tk.Label(inner, text="▸ " + s["task"], bg=card_bg, fg=MUTED, font=small, anchor="w", justify="left", wraplength=width - 40).pack(fill="x")
-            bind_click(card, s)
+            bind_card(card, s)
         tk.Frame(body, bg=BG, height=6).pack()
 
-    def tick():
-        sessions = load_sessions()
-        sig = [(s.get("session_id"), s.get("state"), detail_line(s), s.get("task"), s.get("title"), s.get("custom_title"), s.get("tmux_pane")) for s in sessions]
-        if sig != ui["sig"]:
-            ui["sig"] = sig
-            render(sessions)
-            now_waiting = {s["session_id"] for s in sessions if s.get("state") == "waiting"}
-            if now_waiting - {k for k, v in ui["prev"].items() if v == "waiting"} and ui["prev"]:
+    def alert(waiting, done):
+        if waiting:
+            if prefs["flash"]:
                 flash()
+            if prefs["sound"]:
                 try:
                     if IS_WINDOWS:
                         import winsound
@@ -449,15 +648,32 @@ def main():
                         root.bell()
                 except Exception:
                     pass
-            ui["prev"] = {s["session_id"]: s.get("state") for s in sessions}
+        for s in (waiting if prefs["notify_waiting"] else []) + (done if prefs["notify_done"] else []):
+            send_notification(s, lambda s=s: open_terminal(s))
+
+    def tick():
         now = time.time()
-        for lbl, ts in ui["ages"]:
-            lbl.configure(text=format_age(ts, now))
+        sessions = load_sessions()
+        shown = visible_sessions(sessions, prefs, ui["dismissed"])
+        sig = [(s.get("session_id"), s.get("state"), detail_line(s), s.get("task"), s.get("title"), s.get("custom_title"),
+                tuple(s.get("subagents") or ()), is_quiet(s, now, prefs["quiet_minutes"])) for s in shown]
+        if sig != ui["sig"]:
+            ui["sig"] = sig
+            render(shown, now)
+        alert(*transitions(ui["prev"], sessions))
+        ui["prev"] = {s.get("session_id"): s.get("state") for s in sessions}
+        for lbl, s in ui["times"]:
+            lbl.configure(text=card_time(s, now))
+        accent = STATE_STYLE[top_state(sessions)][1] if top_state(sessions) else HEADER
+        state_bar.configure(bg=accent)
+        diamond.configure(fg=accent if sessions else MUTED)
         notice, until = ui["notice"]
-        summary.configure(text=notice if notice and now < until else counts_summary(sessions))
+        hidden = len(sessions) - len(shown)
+        text = counts_summary(sessions) + (f" · {hidden} hidden" if hidden else "")
+        summary.configure(text=notice if notice and now < until else text)
         root.after(1000, tick)
 
-    if not ui["collapsed"]:
+    if not prefs["collapsed"]:
         body.pack(fill="both")
     tick()
     root.mainloop()

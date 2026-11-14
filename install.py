@@ -5,10 +5,11 @@
     python3 install.py --no-autostart  # install without starting at login
     python3 install.py uninstall
 
-Run it from WSL or native Linux, wherever Claude Code runs. It:
+Run it with the Python of the system where Claude Code runs (WSL, Linux or
+Windows). It:
   * registers hook.py (from wherever this folder lives) in ~/.claude/settings.json
-  * WSL:   adds Windows Start Menu + Startup shortcuts that open the window
-  * Linux: adds an app-menu entry + login autostart entry
+  * WSL / Windows: adds Start Menu + Startup shortcuts that open the window
+  * Linux:         adds an app-menu entry + login autostart entry
 """
 import argparse
 import copy
@@ -25,13 +26,15 @@ APP_DIR = Path(__file__).resolve().parent
 NAME = "claude-agent-monitor"
 MARKER = "# claude-agent-monitor"
 LEGACY = re.compile(r"/\.claude/agent-monitor/hook\.py\b")
-EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "SessionEnd"]
+EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "SessionEnd",
+          "SubagentStart", "SubagentStop"]
 
 
 # ---------- pure helpers (unit-tested) ----------
 
-def hook_command(app_dir):
-    return f'python3 "{Path(app_dir) / "hook.py"}" {MARKER}'
+def hook_command(app_dir, python="python3"):
+    exe = python if python == "python3" else f'"{python}"'
+    return f'{exe} "{(Path(app_dir) / "hook.py").as_posix()}" {MARKER}'
 
 
 def _is_ours(command):
@@ -63,6 +66,12 @@ def update_hooks(settings, command):
 
 def remove_hooks(settings):
     return _without_ours(settings)
+
+
+def platform_kind():
+    if sys.platform == "win32":
+        return "windows"
+    return "wsl" if is_wsl() else "linux"
 
 
 def is_wsl(osrelease=None):
@@ -169,18 +178,35 @@ def _ps_str(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def install_windows(autostart):
+def windows_python():
+    """(python.exe, pythonw.exe) on Windows, as forward-slash paths, or None."""
+    if sys.platform == "win32":
+        exe = Path(sys.executable)
+        return exe.as_posix(), exe.with_name("pythonw.exe").as_posix()
     out = _windows(["cmd.exe", "/c", "where", "pythonw"]).stdout
-    candidates = [l.strip() for l in out.splitlines() if l.strip().lower().endswith("pythonw.exe") and "windowsapps" not in l.lower()]
-    if not candidates:
+    for line in out.splitlines():
+        line = line.strip()
+        if line.lower().endswith("pythonw.exe") and "windowsapps" not in line.lower():
+            pythonw = line.replace("\\", "/")
+            return pythonw[: -len("pythonw.exe")] + "python.exe", pythonw
+    return None
+
+
+def install_windows(autostart, kind):
+    found = windows_python()
+    if not found:
         print("  ! No Windows Python found (pythonw.exe). Install Python for Windows from python.org, then re-run.")
         return False
-    args = windows_arguments(_wslpath(APP_DIR / "monitor.pyw"), _wslpath(sessions_dir()))
+    pythonw = found[1]
+    if kind == "wsl":
+        args = windows_arguments(_wslpath(APP_DIR / "monitor.pyw"), _wslpath(sessions_dir()))
+    else:
+        args = f'"{APP_DIR / "monitor.pyw"}"'
     folders = '[Environment]::GetFolderPath("Programs")' + (', [Environment]::GetFolderPath("Startup")' if autostart else "")
     script = (
         f"$s = New-Object -ComObject WScript.Shell; foreach ($d in @({folders})) {{"
         f" $l = $s.CreateShortcut((Join-Path $d 'Claude Agent Monitor.lnk'));"
-        f" $l.TargetPath = {_ps_str(candidates[0])}; $l.Arguments = {_ps_str(args)};"
+        f" $l.TargetPath = {_ps_str(pythonw)}; $l.Arguments = {_ps_str(args)};"
         f" $l.WorkingDirectory = $env:USERPROFILE; $l.Description = 'Floating Claude Code agent monitor';"
         f" $l.Save(); $l.FullName }}"
     )
@@ -213,19 +239,30 @@ def main(argv=None):
         print(f"Could not read {path}: {exc}\nFix or remove that file, then re-run. Nothing was changed.")
         return 1
 
-    wsl = is_wsl()
+    kind = platform_kind()
     if opts.action == "uninstall":
         write_settings(path, remove_hooks(settings))
-        uninstall_windows() if wsl else uninstall_linux()
+        uninstall_linux() if kind == "linux" else uninstall_windows()
         print(f"Uninstalled. Session data is left in {sessions_dir()} (safe to delete).")
         return 0
 
+    if kind == "windows":
+        found = windows_python()
+        if not found:
+            print("Could not locate this Python's executable. Nothing was changed.")
+            return 1
+        command = hook_command(APP_DIR, python=found[0])
+    else:
+        command = hook_command(APP_DIR)
     sessions_dir().mkdir(parents=True, exist_ok=True)
-    write_settings(path, update_hooks(settings, hook_command(APP_DIR)))
+    write_settings(path, update_hooks(settings, command))
     print(f"Claude Agent Monitor installed from {APP_DIR}")
     print(f"  hooks registered in {path} (new Claude sessions pick them up)")
-    ok = install_windows(not opts.no_autostart) if wsl else (install_linux(not opts.no_autostart) or True)
-    return 0 if ok else 1
+    autostart = not opts.no_autostart
+    if kind == "linux":
+        install_linux(autostart)
+        return 0
+    return 0 if install_windows(autostart, kind) else 1
 
 
 if __name__ == "__main__":

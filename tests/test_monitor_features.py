@@ -149,5 +149,64 @@ class SubagentLabelTests(unittest.TestCase):
         self.assertEqual(monitor.subagent_label({}), "")
 
 
+class MacTests(unittest.TestCase):
+    HOSTILE = 'x" & (do shell script "touch /tmp/pwned") & "'
+
+    def scripts(self, argv):
+        return [argv[i + 1] for i, a in enumerate(argv) if a == "-e"]
+
+    def test_notification_passes_text_as_arguments_not_script(self):
+        argv, env = monitor.notify_command("darwin", self.HOSTILE, "body " + self.HOSTILE)
+        self.assertEqual(argv[0], "osascript")
+        self.assertEqual(argv[-2:], [self.HOSTILE, "body " + self.HOSTILE])
+        self.assertEqual(env, {})
+        self.assertTrue(all("pwned" not in script for script in self.scripts(argv)))
+        self.assertIn("on run argv", self.scripts(argv))
+
+    def test_parse_window_listing(self):
+        text = "Terminal\t✳ shop · Fix login\niTerm2\tother — zsh\n\nno-tab-line\nCode\t\nFinder\tmissing value\n"
+        entries = monitor.parse_macos_windows(text)
+        self.assertEqual([(e["proc"], e["name"]) for e in entries],
+                         [("Terminal", "✳ shop · Fix login"), ("iTerm2", "other — zsh")])
+        self.assertEqual([e["k"] for e in entries], [0, 1])
+        self.assertEqual(monitor.parse_entries(json.dumps(entries)), entries)  # same shape as other platforms
+        target = monitor.choose_target({"title": "Fix login", "project": "shop"}, entries)
+        self.assertEqual(target["proc"], "Terminal")
+
+    def test_raise_command_passes_names_as_arguments(self):
+        argv = monitor.macos_raise_command("Terminal", self.HOSTILE)
+        self.assertEqual(argv[0], "osascript")
+        self.assertEqual(argv[-2:], ["Terminal", self.HOSTILE])
+        self.assertTrue(all("pwned" not in script for script in self.scripts(argv)))
+
+    def test_missing_accessibility_permission_gets_a_readable_hint(self):
+        for err in ["execution error: System Events got an error: osascript is not allowed assistive access. (-1719)",
+                    "execution error: Not authorized to send Apple events to System Events. (-1743)",
+                    "(-25211)"]:
+            self.assertIn("Accessibility", monitor.macos_focus_error(err), err)
+        self.assertEqual(monitor.macos_focus_error("something else"), "could not list windows")
+
+    def test_right_click_events(self):
+        self.assertEqual(monitor.right_click_events("darwin"), ("<Button-2>", "<Control-Button-1>"))
+        self.assertEqual(monitor.right_click_events("linux"), ("<Button-3>",))
+        self.assertEqual(monitor.right_click_events("win32"), ("<Button-3>",))
+
+    def test_fonts_per_platform(self):
+        mac, linux, win = (monitor.ui_fonts(p) for p in ("darwin", "linux", "win32"))
+        self.assertEqual(mac["font"][0], "Helvetica Neue")
+        self.assertGreater(mac["font"][1], linux["font"][1])
+        self.assertEqual(linux["font"], ("Ubuntu", 9))
+        self.assertEqual(win["bold"], ("Segoe UI Semibold", 9))
+        self.assertEqual(set(mac), {"font", "bold", "small", "tiny_bold"})
+
+    def test_extend_path_adds_homebrew_dirs_once(self):
+        once = monitor.extend_path("/usr/bin:/bin")
+        self.assertEqual(once.split(":")[:2], ["/usr/bin", "/bin"])
+        self.assertIn("/opt/homebrew/bin", once.split(":"))
+        self.assertIn("/usr/local/bin", once.split(":"))
+        self.assertEqual(monitor.extend_path(once), once)
+        self.assertEqual(monitor.extend_path(""), "/opt/homebrew/bin:/usr/local/bin")
+
+
 if __name__ == "__main__":
     unittest.main()

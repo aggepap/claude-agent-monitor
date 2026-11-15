@@ -9,6 +9,7 @@ exits 0 so it cannot disturb Claude.
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -23,7 +24,30 @@ def snippet(text, limit=SNIPPET):
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+HAS_PROC = Path("/proc/self/stat").exists()  # False on macOS
+
+
+def parse_ps(text):
+    """`ps -o ppid=,lstart=,args=` -> (ppid, start time, command line), or None."""
+    parts = (text or "").split()
+    if len(parts) < 7 or not parts[0].isdigit():
+        return None
+    return int(parts[0]), " ".join(parts[1:6]), " ".join(parts[6:])
+
+
+def _ps_info(pid):
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=,lstart=,args=", "-p", str(int(pid))], capture_output=True, text=True,
+                             timeout=2, env={**os.environ, "LC_ALL": "C"}).stdout
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return parse_ps(out)
+
+
 def proc_starttime(pid):
+    if not HAS_PROC:
+        info = _ps_info(pid)
+        return info[1] if info else None
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
         return stat[stat.rindex(")") + 2 :].split()[19]
@@ -32,12 +56,19 @@ def proc_starttime(pid):
 
 
 def _proc_info(pid):
+    """(comm, ppid, cmdline, start time) of a process, or None."""
+    if not HAS_PROC:
+        info = _ps_info(pid)
+        if not info:
+            return None
+        ppid, start, cmdline = info
+        return os.path.basename(cmdline.split(" ", 1)[0]), ppid, cmdline, start
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
         comm = stat[stat.index("(") + 1 : stat.rindex(")")]
         ppid = int(stat[stat.rindex(")") + 2 :].split()[1])
         cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
-        return comm, ppid, cmdline
+        return comm, ppid, cmdline, None
     except (OSError, ValueError, IndexError):
         return None
 
@@ -49,9 +80,9 @@ def find_claude_process():
         info = _proc_info(pid)
         if not info:
             break
-        comm, ppid, cmdline = info
+        comm, ppid, cmdline, start = info
         if comm == "claude" or re.search(r"(^|/)claude(\s|$)|claude-code", cmdline):
-            return pid, proc_starttime(pid)
+            return pid, start or proc_starttime(pid)
         if ppid <= 1:
             break
         pid = ppid
@@ -142,7 +173,7 @@ STALE_AFTER = 24 * 3600
 
 
 def is_dead(data, now):
-    """Process gone (checked via /proc), or, where that can't be checked
+    """Process gone (checked via /proc, or `ps` on macOS), or, where that can't be checked
     (e.g. native Windows), no activity for a day."""
     pid, start = data.get("pid"), data.get("pid_start")
     if isinstance(pid, int) and start is not None:

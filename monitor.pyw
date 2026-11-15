@@ -1,12 +1,13 @@
 """Floating always-on-top window listing Claude Code sessions.
 
 Linux:    python3 monitor.pyw
+macOS:    python3 monitor.pyw
 Windows:  pythonw.exe monitor.pyw --sessions \\\\wsl.localhost\\<distro>\\home\\<you>\\.claude\\agent-monitor\\sessions
 (install.py creates these launchers for you.)
 
 Drag the header to move · double-click it to collapse · right-click for the
 menu (Settings…). Right-click a card to dismiss it. Click a card to jump to its terminal (Windows Terminal, tmux, VS Code,
-X11 windows via wmctrl, GNOME Wayland via the "Activate Window By Title" extension).
+X11 windows via wmctrl, GNOME Wayland via the "Activate Window By Title" extension, macOS via System Events).
 """
 import json
 import os
@@ -17,6 +18,7 @@ import time
 from pathlib import Path
 
 IS_WINDOWS = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
 
 
 def resolve_sessions_dir(argv, home):
@@ -168,6 +170,77 @@ def gnome_activate_command(needle):
             "--method", "de.lucaswerkmeister.ActivateWindowByTitle.activateBySubstring", needle]
 
 
+# macOS: values always arrive as argv items of `on run argv`, never inside the script text.
+MAC_LIST_WINDOWS = """
+set out to ""
+tell application "System Events"
+  get name of every window of (first process whose frontmost is true) -- fails here without Accessibility access
+  repeat with p in (every process whose background only is false)
+    try
+      set pn to name of p
+      repeat with w in (every window of p)
+        try
+          set out to out & pn & tab & (name of w as text) & linefeed
+        end try
+      end repeat
+    end try
+  end repeat
+end tell
+return out
+"""
+MAC_RAISE = ["on run argv", "tell application \"System Events\"", "tell process (item 1 of argv)",
+             "set frontmost to true", "perform action \"AXRaise\" of (first window whose name is (item 2 of argv))",
+             "end tell", "end tell", "end run"]
+MAC_NOTIFY = ["on run argv", "display notification (item 2 of argv) with title (item 1 of argv)", "end run"]
+
+
+def osascript(lines, *args):
+    argv = ["osascript"]
+    for line in lines:
+        argv += ["-e", line]
+    return argv + list(args)
+
+
+def parse_macos_windows(text):
+    """`process<TAB>window title` lines from MAC_LIST_WINDOWS -> entries for choose_target."""
+    entries = []
+    for line in (text or "").splitlines():
+        proc, sep, name = line.partition("\t")
+        if sep and proc and name.strip() and name != "missing value":  # AppleScript's text for an untitled window
+            entries.append({"k": len(entries), "kind": "tab", "hwnd": len(entries), "name": name, "proc": proc})
+    return entries
+
+
+def macos_raise_command(proc, title):
+    return osascript(MAC_RAISE, proc, title)
+
+
+def macos_focus_error(stderr):
+    if re.search(r"-1719|-1743|-25211|assistive|not authori[sz]ed", stderr or "", re.I):
+        return "allow Accessibility for Python (see README)"
+    return "could not list windows"
+
+
+def right_click_events(platform):
+    # Tk on macOS reports the secondary button as Button-2; Ctrl-click is the trackpad habit.
+    return ("<Button-2>", "<Control-Button-1>") if platform == "darwin" else ("<Button-3>",)
+
+
+def ui_fonts(platform):
+    if platform == "win32":
+        return {"font": ("Segoe UI", 9), "bold": ("Segoe UI Semibold", 9),
+                "small": ("Segoe UI", 8), "tiny_bold": ("Segoe UI Semibold", 8)}
+    family, base = ("Helvetica Neue", 12) if platform == "darwin" else ("Ubuntu", 9)
+    return {"font": (family, base), "bold": (family, base, "bold"),
+            "small": (family, base - 1), "tiny_bold": (family, base - 1, "bold")}
+
+
+def extend_path(path):
+    """GUI apps on macOS start with a bare PATH; add Homebrew's dirs so tmux is found."""
+    parts = [p for p in (path or "").split(":") if p]
+    return ":".join(parts + [d for d in ("/opt/homebrew/bin", "/usr/local/bin") if d not in parts])
+
+
 def counts_summary(sessions):
     if not sessions:
         return "no sessions"
@@ -272,6 +345,8 @@ def notify_command(platform, title, body):
     if platform == "win32":
         return ([system_exe("powershell.exe"), "-NoProfile", "-NonInteractive", "-Command", TOAST_PS],
                 {"CAM_TITLE": title, "CAM_BODY": body})
+    if platform == "darwin":
+        return osascript(MAC_NOTIFY, title, body), {}
     return (["notify-send", "-a", "Claude Agent Monitor", "-i", "utilities-system-monitor", "-A", "open=Open", title, body], {})
 
 
@@ -331,18 +406,40 @@ def bring_to_front(hwnd):
 
 def focus_session(session):
     """Returns a short status string for the header."""
-    return focus_windows(session) if IS_WINDOWS else focus_linux(session)
+    if IS_WINDOWS:
+        return focus_windows(session)
+    return focus_macos(session) if IS_MAC else focus_linux(session)
+
+
+def switch_tmux(session):
+    """Select the session's tmux pane; returns a header note if it worked."""
+    import shutil
+    import subprocess
+    args = tmux_args(session)
+    if not (args and shutil.which("tmux")):
+        return ""
+    switched = subprocess.run(args, capture_output=True, timeout=5).returncode == 0
+    time.sleep(0.2)  # let tmux push the pane title to the terminal window
+    return "tmux pane selected" if switched else ""
+
+
+def focus_macos(session):
+    import subprocess
+    pane_note = switch_tmux(session)
+    listing = subprocess.run(osascript([MAC_LIST_WINDOWS]), capture_output=True, text=True, timeout=10)
+    if listing.returncode != 0:
+        return pane_note or macos_focus_error(listing.stderr)
+    target = choose_target(session, parse_macos_windows(listing.stdout))
+    if not target:
+        return pane_note or "terminal not found"
+    subprocess.run(macos_raise_command(target["proc"], target["name"]), capture_output=True, timeout=5)
+    return ""
 
 
 def focus_linux(session):
     import shutil
     import subprocess
-    switched = False
-    args = tmux_args(session)
-    if args and shutil.which("tmux"):
-        switched = subprocess.run(args, capture_output=True, timeout=5).returncode == 0
-        time.sleep(0.2)  # let tmux push the pane title to the terminal window
-    pane_note = "tmux pane selected" if switched else ""
+    pane_note = switch_tmux(session)
     if os.environ.get("WAYLAND_DISPLAY"):
         if shutil.which("gdbus"):
             for needle in title_needles(session):
@@ -403,6 +500,9 @@ def send_notification(session, on_open):
                 subprocess.run(argv, env={**os.environ, **extra}, capture_output=True, timeout=15,
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 return
+            if IS_MAC:  # no action buttons on osascript notifications
+                subprocess.run(argv, capture_output=True, timeout=15)
+                return
             if not shutil.which("notify-send"):
                 return
             r = subprocess.run(argv, capture_output=True, text=True, timeout=600)
@@ -428,6 +528,8 @@ def main():
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
+    if IS_MAC:
+        os.environ["PATH"] = extend_path(os.environ.get("PATH", ""))
 
     prefs = load_prefs(PREFS)
     root = tk.Tk()
@@ -439,11 +541,9 @@ def main():
     root.geometry(f"+{prefs['x']}+{prefs['y']}")
 
     width = 380
-    family = "Segoe UI" if IS_WINDOWS else "Ubuntu"
-    font = (family, 9)
-    bold = ("Segoe UI Semibold", 9) if IS_WINDOWS else (family, 9, "bold")
-    small = (family, 8)
-    tiny_bold = ("Segoe UI Semibold", 8) if IS_WINDOWS else (family, 8, "bold")
+    fonts = ui_fonts(sys.platform)
+    font, bold, small, tiny_bold = fonts["font"], fonts["bold"], fonts["small"], fonts["tiny_bold"]
+    right_click = right_click_events(sys.platform)
     ui = {"sig": None, "prev": None, "times": [], "notice": ("", 0), "dismissed": {}, "settings": None}
 
     header = tk.Frame(root, bg=HEADER, width=width)
@@ -556,7 +656,8 @@ def main():
         w.bind("<B1-Motion>", do_drag)
         w.bind("<ButtonRelease-1>", lambda e: persist())
         w.bind("<Double-Button-1>", toggle)
-        w.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
+        for event in right_click:
+            w.bind(event, lambda e: menu.tk_popup(e.x_root, e.y_root))
     close.bind("<Button-1>", quit_app)
 
     def flash(times=6):
@@ -586,7 +687,8 @@ def main():
     def bind_card(widget, session):
         widget.configure(cursor="hand2")
         widget.bind("<Button-1>", lambda e: open_terminal(session))
-        widget.bind("<Button-3>", lambda e: card_menu(e, session))
+        for event in right_click:
+            widget.bind(event, lambda e: card_menu(e, session))
         for child in widget.winfo_children():
             bind_card(child, session)
 

@@ -229,5 +229,52 @@ class RobustnessTests(HookTestCase):
         self.assertEqual(names, ["s1.json"])
 
 
+class NoProcFallbackTests(unittest.TestCase):
+    """macOS has no /proc: process info comes from `ps` instead."""
+
+    def setUp(self):
+        patcher = mock.patch.object(hook, "HAS_PROC", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_parse_ps_splits_parent_start_time_and_command(self):
+        line = "  412 Sun Nov  1 09:05:03 2026     node /opt/homebrew/bin/claude --resume\n"
+        self.assertEqual(hook.parse_ps(line), (412, "Sun Nov 1 09:05:03 2026", "node /opt/homebrew/bin/claude --resume"))
+
+    def test_parse_ps_rejects_empty_or_garbage(self):
+        for text in ["", "\n", "abc def", "12 Sun Nov"]:
+            self.assertIsNone(hook.parse_ps(text), text)
+
+    def test_start_time_of_this_process_is_stable(self):
+        first = hook.proc_starttime(os.getpid())
+        self.assertIsNotNone(first)
+        self.assertEqual(hook.proc_starttime(os.getpid()), first)
+
+    def test_start_time_of_missing_process_is_none(self):
+        self.assertIsNone(hook.proc_starttime(999999999))
+
+    def test_ps_failure_gives_none_without_raising(self):
+        with mock.patch.object(hook.subprocess, "run", side_effect=OSError("no ps")):
+            self.assertIsNone(hook.proc_starttime(os.getpid()))
+
+    def test_parent_walk_finds_claude_by_command_line(self):
+        chain = {
+            300: (200, "Sun Nov 1 09:00:00 2026", "/bin/zsh -c python3 hook.py"),
+            200: (100, "Sun Nov 1 08:00:00 2026", "node /opt/homebrew/bin/claude"),
+        }
+        with mock.patch.object(hook.os, "getppid", return_value=300), \
+                mock.patch.object(hook, "_ps_info", side_effect=chain.get):
+            self.assertEqual(hook.find_claude_process(), (200, "Sun Nov 1 08:00:00 2026"))
+
+    def test_live_session_kept_and_dead_or_reused_pruned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            me = hook.proc_starttime(os.getpid())
+            for name, pid, start in [("live", os.getpid(), me), ("dead", 999999999, "x"), ("reused", os.getpid(), "x")]:
+                (d / f"{name}.json").write_text(json.dumps({"session_id": name, "pid": pid, "pid_start": start}))
+            hook.prune_dead(d, keep="none.json")
+            self.assertEqual(sorted(p.name for p in d.glob("*.json")), ["live.json"])
+
+
 if __name__ == "__main__":
     unittest.main()

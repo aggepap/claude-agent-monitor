@@ -5,17 +5,20 @@
     python3 install.py --no-autostart  # install without starting at login
     python3 install.py uninstall
 
-Run it with the Python of the system where Claude Code runs (WSL, Linux or
-Windows). It:
+Run it with the Python of the system where Claude Code runs (WSL, Linux,
+macOS or Windows). It:
   * registers hook.py (from wherever this folder lives) in ~/.claude/settings.json
   * WSL / Windows: adds Start Menu + Startup shortcuts that open the window
   * Linux:         adds an app-menu entry + login autostart entry
+  * macOS:         adds ~/Applications/Claude Agent Monitor.app + a login LaunchAgent
 """
 import argparse
 import copy
 import json
 import os
+import plistlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -25,6 +28,8 @@ from pathlib import Path
 APP_DIR = Path(__file__).resolve().parent
 NAME = "claude-agent-monitor"
 MARKER = "# claude-agent-monitor"
+LAUNCH_LABEL = "com.github.aggepap.claude-agent-monitor"
+APP_NAME = "Claude Agent Monitor"
 LEGACY = re.compile(r"/\.claude/agent-monitor/hook\.py\b")
 EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "SessionEnd",
           "SubagentStart", "SubagentStop"]
@@ -71,6 +76,8 @@ def remove_hooks(settings):
 def platform_kind():
     if sys.platform == "win32":
         return "windows"
+    if sys.platform == "darwin":
+        return "macos"
     return "wsl" if is_wsl() else "linux"
 
 
@@ -96,6 +103,40 @@ def desktop_entry(python, monitor):
         "X-GNOME-Autostart-enabled=true",
         "",
     ])
+
+
+def launch_agent_plist(python, monitor):
+    return plistlib.dumps({
+        "Label": LAUNCH_LABEL,
+        "ProgramArguments": [str(python), str(monitor)],
+        "RunAtLoad": True,
+        "ProcessType": "Interactive",
+    })
+
+
+def app_bundle_files(python, monitor):
+    """Relative path inside the .app -> file content, for a minimal launcher app."""
+    info = plistlib.dumps({
+        "CFBundleName": APP_NAME,
+        "CFBundleDisplayName": APP_NAME,
+        "CFBundleIdentifier": LAUNCH_LABEL,
+        "CFBundleExecutable": "launcher",
+        "CFBundlePackageType": "APPL",
+        "CFBundleVersion": "1.0",
+        "LSUIElement": True,  # no Dock icon of its own; Python's Tk window still shows
+    })
+    launcher = f"#!/bin/sh\nexec {shlex.quote(str(python))} {shlex.quote(str(monitor))}\n"
+    return {"Contents/Info.plist": info, "Contents/MacOS/launcher": launcher}
+
+
+def macos_tk_hint(tk_version):
+    """Warning for a missing or too-old Tk (Apple's Command Line Tools Python ships 8.5), or None."""
+    fix = "Use Python from python.org, or Homebrew:  brew install python-tk"
+    if tk_version is None:
+        return f"Tk is missing. {fix}"
+    if tk_version < 8.6:
+        return f"This Python has Tk {tk_version}, which is too old for macOS. {fix}, then re-run install.py with it."
+    return None
 
 
 def windows_arguments(monitor_unc, sessions_unc):
@@ -160,6 +201,56 @@ def uninstall_linux():
     for path in linux_desktop_files():
         if path.exists():
             path.unlink()
+
+
+def macos_paths():
+    return (Path.home() / "Applications" / f"{APP_NAME}.app",
+            Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_LABEL}.plist")
+
+
+def _launchctl(args):
+    try:
+        subprocess.run(["launchctl", *args], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def install_macos(autostart):
+    app, agent = macos_paths()
+    monitor = APP_DIR / "monitor.pyw"
+    if app.exists():
+        shutil.rmtree(app)
+    for rel, content in app_bundle_files(sys.executable, monitor).items():
+        path = app / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content) if isinstance(content, bytes) else path.write_text(content)
+    (app / "Contents/MacOS/launcher").chmod(0o755)
+    print(f"  app:       {app}")
+    if autostart:
+        agent.parent.mkdir(parents=True, exist_ok=True)
+        agent.write_bytes(launch_agent_plist(sys.executable, monitor))
+        print(f"  autostart: {agent}")
+    elif agent.exists():
+        _launchctl(["bootout", f"gui/{os.getuid()}/{LAUNCH_LABEL}"])
+        agent.unlink()
+    try:
+        import tkinter
+        hint = macos_tk_hint(float(tkinter.TkVersion))
+    except ImportError:
+        hint = macos_tk_hint(None)
+    if hint:
+        print(f"  ! {hint}")
+    print("  Click-to-open needs Accessibility access for Python: you'll be asked on the first click\n"
+          "  (System Settings > Privacy & Security > Accessibility). See docs/MACOS.md.")
+
+
+def uninstall_macos():
+    app, agent = macos_paths()
+    _launchctl(["bootout", f"gui/{os.getuid()}/{LAUNCH_LABEL}"])
+    if agent.exists():
+        agent.unlink()
+    if app.exists():
+        shutil.rmtree(app)
 
 
 def _windows(cmd):
@@ -242,7 +333,7 @@ def main(argv=None):
     kind = platform_kind()
     if opts.action == "uninstall":
         write_settings(path, remove_hooks(settings))
-        uninstall_linux() if kind == "linux" else uninstall_windows()
+        {"linux": uninstall_linux, "macos": uninstall_macos}.get(kind, uninstall_windows)()
         print(f"Uninstalled. Session data is left in {sessions_dir()} (safe to delete).")
         return 0
 
@@ -252,6 +343,8 @@ def main(argv=None):
             print("Could not locate this Python's executable. Nothing was changed.")
             return 1
         command = hook_command(APP_DIR, python=found[0])
+    elif kind == "macos":
+        command = hook_command(APP_DIR, python=sys.executable)  # bare python3 may be Apple's Xcode stub
     else:
         command = hook_command(APP_DIR)
     sessions_dir().mkdir(parents=True, exist_ok=True)
@@ -259,8 +352,8 @@ def main(argv=None):
     print(f"Claude Agent Monitor installed from {APP_DIR}")
     print(f"  hooks registered in {path} (new Claude sessions pick them up)")
     autostart = not opts.no_autostart
-    if kind == "linux":
-        install_linux(autostart)
+    if kind in ("linux", "macos"):
+        (install_linux if kind == "linux" else install_macos)(autostart)
         return 0
     return 0 if install_windows(autostart, kind) else 1
 

@@ -1,5 +1,7 @@
 import json
 import os
+import plistlib
+import shlex
 import sys
 import tempfile
 import unittest
@@ -88,6 +90,7 @@ class LinuxInstallTests(unittest.TestCase):
         patches = [
             mock.patch.dict(os.environ, {"HOME": str(self.home)}),
             mock.patch.object(install, "is_wsl", return_value=False),
+            mock.patch.object(install.sys, "platform", "linux"),  # also when the suite runs on macOS CI
         ]
         for p in patches:
             p.start()
@@ -168,6 +171,87 @@ class NativeWindowsInstallTests(unittest.TestCase):
         install.main(["install"])
         self.assertEqual(install.main(["uninstall"]), 0)
         self.assertIn("Remove-Item", self.scripts[-1])
+
+
+class MacHelperTests(unittest.TestCase):
+    PY = "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
+    MON = "/Users/me/My \"Tools\"/$cam/monitor.pyw"
+
+    def test_darwin_is_detected_as_macos(self):
+        with mock.patch.object(install.sys, "platform", "darwin"):
+            self.assertEqual(install.platform_kind(), "macos")
+
+    def test_launch_agent_runs_monitor_at_login(self):
+        plist = plistlib.loads(install.launch_agent_plist(self.PY, self.MON))
+        self.assertEqual(plist["Label"], install.LAUNCH_LABEL)
+        self.assertEqual(plist["ProgramArguments"], [self.PY, self.MON])
+        self.assertTrue(plist["RunAtLoad"])
+
+    def test_app_bundle_launcher_quotes_paths(self):
+        files = install.app_bundle_files(self.PY, self.MON)
+        info = plistlib.loads(files["Contents/Info.plist"])
+        self.assertEqual(info["CFBundleExecutable"], "launcher")
+        self.assertEqual(info["CFBundlePackageType"], "APPL")
+        script = files["Contents/MacOS/launcher"]
+        self.assertTrue(script.startswith("#!/bin/sh\n"))
+        exec_line = [line for line in script.splitlines() if line.startswith("exec ")][0]
+        self.assertEqual(shlex.split(exec_line), ["exec", self.PY, self.MON])
+
+    def test_tk_hint(self):
+        self.assertIn("python-tk", install.macos_tk_hint(None))
+        self.assertIn("8.5", install.macos_tk_hint(8.5))
+        self.assertIsNone(install.macos_tk_hint(8.6))
+        self.assertIsNone(install.macos_tk_hint(9.0))
+
+
+class MacInstallTests(unittest.TestCase):
+    PY = "/opt/homebrew/bin/python3.12"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.launchctl = []
+        patches = [
+            mock.patch.dict(os.environ, {"HOME": str(self.home)}),
+            mock.patch.object(install, "platform_kind", return_value="macos"),
+            mock.patch.object(install.sys, "executable", self.PY),
+            mock.patch.object(install, "_launchctl", side_effect=self.launchctl.append),
+            mock.patch.object(install, "_ps", side_effect=AssertionError("Windows code used on macOS")),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.app = self.home / "Applications" / "Claude Agent Monitor.app"
+        self.agent = self.home / "Library" / "LaunchAgents" / f"{install.LAUNCH_LABEL}.plist"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_install_registers_hook_with_this_python_and_creates_app_and_login_item(self):
+        self.assertEqual(install.main(["install"]), 0)
+        settings = json.loads((self.home / ".claude" / "settings.json").read_text())
+        self.assertEqual(commands(settings, "Stop"), [install.hook_command(APP, python=self.PY)])
+        launcher = self.app / "Contents" / "MacOS" / "launcher"
+        self.assertTrue(os.access(launcher, os.X_OK))
+        self.assertIn(str(APP / "monitor.pyw"), launcher.read_text())
+        self.assertTrue((self.app / "Contents" / "Info.plist").exists())
+        self.assertEqual(plistlib.loads(self.agent.read_bytes())["ProgramArguments"], [self.PY, str(APP / "monitor.pyw")])
+        self.assertFalse((self.home / ".local/share/applications").exists())
+
+    def test_no_autostart_removes_login_item(self):
+        install.main(["install"])
+        install.main(["install", "--no-autostart"])
+        self.assertFalse(self.agent.exists())
+        self.assertTrue(self.app.exists())
+
+    def test_uninstall_removes_app_and_login_item(self):
+        install.main(["install"])
+        self.assertEqual(install.main(["uninstall"]), 0)
+        settings = json.loads((self.home / ".claude" / "settings.json").read_text())
+        self.assertEqual(commands(settings, "Stop"), [])
+        self.assertFalse(self.app.exists())
+        self.assertFalse(self.agent.exists())
+        self.assertTrue(any("bootout" in call for call in self.launchctl))
 
 
 if __name__ == "__main__":

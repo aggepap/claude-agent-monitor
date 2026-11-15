@@ -210,3 +210,34 @@ class MacTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+XRANDR = """Monitors: 2
+ 0: +*DP-2 3440/800x1440/330+1440+715  DP-2
+ 1: +HDMI-4 1440/540x2560/300+0+0  HDMI-4
+"""
+
+
+class OnScreenTests(unittest.TestCase):
+    MONITORS = [(1440, 715, 3440, 1440), (0, 0, 1440, 2560)]  # primary first
+
+    def test_parse_xrandr_puts_primary_first(self):
+        self.assertEqual(monitor.parse_xrandr_monitors(XRANDR), self.MONITORS)
+
+    def test_parse_xrandr_garbage_gives_empty_list(self):
+        self.assertEqual(monitor.parse_xrandr_monitors("not xrandr output"), [])
+
+    def test_visible_position_is_kept(self):
+        self.assertEqual(monitor.on_screen_position(2000, 800, self.MONITORS), (2000, 800))
+        self.assertEqual(monitor.on_screen_position(100, 2000, self.MONITORS), (100, 2000))
+
+    def test_position_in_gap_between_monitors_moves_to_primary(self):
+        # the real bug: saved at (3033, 68), above DP-2 and right of HDMI-4
+        self.assertEqual(monitor.on_screen_position(3033, 68, self.MONITORS), (1480, 755))
+
+    def test_position_hanging_off_the_edge_moves_to_primary(self):
+        self.assertEqual(monitor.on_screen_position(4870, 800, self.MONITORS), (1480, 755))
+        self.assertEqual(monitor.on_screen_position(-500, -500, self.MONITORS), (1480, 755))
+
+    def test_no_monitor_info_keeps_position(self):
+        self.assertEqual(monitor.on_screen_position(3033, 68, []), (3033, 68))

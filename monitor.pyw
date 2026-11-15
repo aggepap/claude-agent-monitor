@@ -207,6 +207,42 @@ def load_prefs(path):
     return prefs
 
 
+def parse_xrandr_monitors(text):
+    """`xrandr --listmonitors` -> [(x, y, w, h), ...] with the primary monitor first."""
+    found = []
+    for m in re.finditer(r"^\s*\d+:\s+\+?(\*?)\S+\s+(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)", text, re.M):
+        primary, w, h, x, y = m.groups()
+        found.append((not primary, (int(x), int(y), int(w), int(h))))
+    return [mon for _, mon in sorted(found, key=lambda item: item[0])]
+
+
+def on_screen_position(x, y, monitors, grab=(40, 20)):
+    """Keep (x, y) if the window's top-left grab area is on a monitor, else move it near the primary's corner.
+
+    Saved positions go stale when monitors are rearranged or unplugged; without this the
+    window opens in a dead zone and looks like it never started."""
+    if not monitors:
+        return x, y
+    gw, gh = grab
+    for mx, my, mw, mh in monitors:
+        if mx <= x and x + gw <= mx + mw and my <= y and y + gh <= my + mh:
+            return x, y
+    mx, my, _, _ = monitors[0]
+    return mx + 40, my + 40
+
+
+def linux_monitors():
+    import shutil
+    import subprocess
+    if IS_WINDOWS or not shutil.which("xrandr"):
+        return []
+    try:
+        out = subprocess.run(["xrandr", "--listmonitors"], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return parse_xrandr_monitors(out)
+
+
 def save_prefs(path, prefs):
     try:
         Path(path).write_text(json.dumps(prefs), encoding="utf-8")
@@ -430,6 +466,7 @@ def main():
             pass
 
     prefs = load_prefs(PREFS)
+    prefs["x"], prefs["y"] = on_screen_position(prefs["x"], prefs["y"], linux_monitors())
     root = tk.Tk()
     root.title("Claude agents")
     root.overrideredirect(True)

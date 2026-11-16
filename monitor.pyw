@@ -134,7 +134,29 @@ def tmux_args(session):
     pane, sock = session.get("tmux_pane") or "", session.get("tmux_socket") or ""
     if not (re.fullmatch(r"%\d+", pane) and re.fullmatch(r"/[\w./-]+", sock)):
         return None
-    return ["tmux", "-S", sock, "select-window", "-t", pane, ";", "select-pane", "-t", pane, ";", "switch-client", "-t", pane]
+    # Run from outside tmux, switch-client moves the most recently used client, which would
+    # replace whatever session that terminal shows. Only do it when no client already shows
+    # the pane's session; otherwise selecting the pane is enough and the window gets raised.
+    return ["tmux", "-S", sock, "select-window", "-t", pane, ";", "select-pane", "-t", pane, ";",
+            "if-shell", "-F", "-t", pane, "#{==:#{session_attached},0}", f"switch-client -t {pane}"]
+
+
+def tmux_attach_args(session):
+    """argv that attaches a new tmux client to the session's pane, or None."""
+    args = tmux_args(session)
+    return args[:3] + ["attach-session", "-t", session["tmux_pane"]] if args else None
+
+
+def terminal_command(terminal, argv):
+    """argv that opens a new terminal window running argv; terminal is the emulator's real path."""
+    name = os.path.basename(terminal or "")
+    if not (name and argv):
+        return None
+    if name == "ptyxis":
+        return [terminal, "--new-window", "--", *argv]
+    if name in ("gnome-terminal", "kgx", "kitty", "wezterm", "foot", "ghostty", "tilix"):
+        return [terminal, *(["start"] if name == "wezterm" else []), "--", *argv]
+    return [terminal, "-e", *argv]  # Debian x-terminal-emulator convention (xterm, konsole, alacritty, ...)
 
 
 def tmux_command(session, distro):
@@ -152,6 +174,15 @@ def title_needles(session):
     if len(project) >= 3:
         needles.append(project)
     return [n for n in needles if n]
+
+
+def linux_match_fields(session):
+    """What to match window titles against on Linux. A tmux session lives in a terminal whose
+    title only shows Claude's title when tmux has set-titles on; without the title, the project
+    name would match an editor window open on the same folder (e.g. VS Code), so drop it."""
+    if tmux_args(session):
+        return {k: v for k, v in session.items() if k != "project"}
+    return session
 
 
 def parse_wmctrl(text):
@@ -459,6 +490,26 @@ def switch_tmux(session):
     return "tmux pane selected" if switched else ""
 
 
+def open_tmux_in_new_terminal(session):
+    """If no terminal shows the session, open one attached to it rather than switching the
+    last-used terminal away from what it shows. Returns a header note, or "" if not done."""
+    import shutil
+    import subprocess
+    args, attach = tmux_args(session), tmux_attach_args(session)
+    terminal = shutil.which("x-terminal-emulator")
+    if not (args and attach and terminal and shutil.which("tmux")):
+        return ""
+    probe = subprocess.run(args[:3] + ["display-message", "-p", "-t", session["tmux_pane"], "#{session_attached}"],
+                           capture_output=True, text=True, timeout=5)
+    if probe.returncode != 0 or probe.stdout.strip() != "0":
+        return ""
+    subprocess.run(args[:3] + ["select-window", "-t", session["tmux_pane"], ";", "select-pane", "-t", session["tmux_pane"]],
+                   capture_output=True, timeout=5)
+    subprocess.Popen(terminal_command(os.path.realpath(terminal), attach), stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return "opened in a new terminal"
+
+
 def focus_macos(session):
     import subprocess
     pane_note = switch_tmux(session)
@@ -475,10 +526,14 @@ def focus_macos(session):
 def focus_linux(session):
     import shutil
     import subprocess
+    opened = open_tmux_in_new_terminal(session)
+    if opened:
+        return opened
     pane_note = switch_tmux(session)
+    match = linux_match_fields(session)
     if os.environ.get("WAYLAND_DISPLAY"):
         if shutil.which("gdbus"):
-            for needle in title_needles(session):
+            for needle in title_needles(match):
                 r = subprocess.run(gnome_activate_command(needle), capture_output=True, text=True, timeout=5)
                 if r.returncode == 0 and "true" in r.stdout:
                     return ""
@@ -488,7 +543,7 @@ def focus_linux(session):
     if not shutil.which("wmctrl"):
         return pane_note or "install wmctrl to jump to terminals"
     listing = subprocess.run(["wmctrl", "-l"], capture_output=True, text=True, timeout=5).stdout
-    target = choose_target(session, parse_wmctrl(listing))
+    target = choose_target(match, parse_wmctrl(listing))
     if not target:
         return pane_note or "terminal not found"
     subprocess.run(["wmctrl", "-i", "-a", hex(target["hwnd"])], capture_output=True, timeout=5)

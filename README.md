@@ -82,7 +82,8 @@ It adds **Claude Agent Monitor** to the app menu and to login autostart.
 
 Click-to-open on Ubuntu:
 
-- **tmux**: clicking always switches tmux to that session's window and pane.
+- **tmux**: clicking selects that session's window and pane in the terminal showing it, or opens a new
+  terminal window attached to it if none does (your other terminals are left alone).
 - **X11** ("Ubuntu on Xorg" login): `sudo apt install wmctrl` and the terminal window is raised too.
 - **Wayland** (Ubuntu's default): GNOME doesn't let apps raise other windows. Install the GNOME
   extension **Activate Window By Title** (extensions.gnome.org, by Lucas Werkmeister) and the

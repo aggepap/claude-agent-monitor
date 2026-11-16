@@ -149,6 +149,32 @@ class SubagentLabelTests(unittest.TestCase):
         self.assertEqual(monitor.subagent_label({}), "")
 
 
+class CardViewTests(unittest.TestCase):
+    def test_waiting_card_is_highlighted_with_state_label(self):
+        v = monitor.card_view({"state": "waiting", "project": "api", "updated_at": NOW}, NOW, 5)
+        self.assertEqual(v["bg"], monitor.CARD_HOT)
+        self.assertEqual((v["label"], v["accent"]), monitor.STATE_STYLE["waiting"])
+        self.assertEqual(v["fg"], monitor.FG)
+
+    def test_quiet_working_card_is_muted(self):
+        v = monitor.card_view({"state": "working", "updated_at": NOW - 600}, NOW, 5)
+        self.assertEqual((v["label"], v["accent"], v["fg"]), ("QUIET?", monitor.MUTED, monitor.MUTED))
+        self.assertEqual(v["bg"], monitor.CARD)
+
+    def test_name_includes_title_and_is_truncated(self):
+        self.assertEqual(monitor.card_view({"project": "api", "title": "fix"}, NOW, 5)["name"], "api · fix")
+        self.assertEqual(monitor.card_view({"project": "api", "custom_title": "mine", "title": "x"}, NOW, 5)["name"], "api · mine")
+        long = monitor.card_view({"project": "p" * 60}, NOW, 5)["name"]
+        self.assertEqual(long, "p" * 44 + "…")
+        self.assertEqual(monitor.card_view({}, NOW, 5)["name"], "?")
+
+    def test_optional_lines_are_empty_when_absent(self):
+        v = monitor.card_view({"state": "done"}, NOW, 5)
+        self.assertEqual((v["agents"], v["task"]), ("", ""))
+        v = monitor.card_view({"state": "working", "task": "tests", "subagents": ["a"], "updated_at": NOW}, NOW, 5)
+        self.assertEqual((v["agents"], v["task"]), ("+1 agent", "▸ tests"))
+
+
 class MacTests(unittest.TestCase):
     HOSTILE = 'x" & (do shell script "touch /tmp/pwned") & "'
 

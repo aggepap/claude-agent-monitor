@@ -422,6 +422,26 @@ def subagent_label(s):
     return f"+{n} agent{'s' if n != 1 else ''}" if n else ""
 
 
+def card_view(s, now, quiet_minutes):
+    """Everything a session card displays, so the UI can update a card in place."""
+    quiet = is_quiet(s, now, quiet_minutes)
+    label, accent = ("QUIET?", MUTED) if quiet else STATE_STYLE.get(s.get("state"), ("?", MUTED))
+    name = s.get("project") or "?"
+    heading = s.get("custom_title") or s.get("title")
+    if heading:
+        name = f"{name} · {heading}"
+    return {
+        "bg": CARD_HOT if s.get("state") == "waiting" else CARD,
+        "fg": MUTED if quiet else FG,
+        "accent": accent,
+        "label": label,
+        "name": name[:44] + ("…" if len(name) > 44 else ""),
+        "agents": subagent_label(s),
+        "detail": detail_line(s),
+        "task": "▸ " + s["task"] if s.get("task") else "",
+    }
+
+
 # ---------- focusing a session's terminal ----------
 
 # Lists Windows Terminal tabs + other top-level windows as JSON, then reads the
@@ -776,13 +796,14 @@ def main():
         ui["dismissed"][session.get("session_id")] = session.get("updated_at")
         ui["sig"] = None
 
-    def bind_card(widget, session):
+    def bind_card(widget, entry):
+        # Handlers read entry["s"] at click time, so a reused card acts on the latest session data.
         widget.configure(cursor="hand2")
-        widget.bind("<Button-1>", lambda e: open_terminal(session))
+        widget.bind("<Button-1>", lambda e: open_terminal(entry["s"]))
         for event in right_click:
-            widget.bind(event, lambda e: card_menu(e, session))
+            widget.bind(event, lambda e: card_menu(e, entry["s"]))
         for child in widget.winfo_children():
-            bind_card(child, session)
+            bind_card(child, entry)
 
     def card_menu(event, session):
         m = tk.Menu(root, tearoff=0)
@@ -790,44 +811,71 @@ def main():
         m.add_command(label="Dismiss", command=lambda: dismiss(session))
         m.tk_popup(event.x_root, event.y_root)
 
+    # Cards are kept per session and updated in place. Destroying and rebuilding every widget on
+    # each change makes the whole window flash on X11, where every widget is its own window.
+    cards = {}
+    empty = tk.Label(body, text="No Claude Code sessions running", bg=BG, fg=MUTED, font=font, pady=14)
+    spacer = tk.Frame(body, bg=BG, height=6)
+
+    def build_card():
+        card = tk.Frame(body)
+        stripe = tk.Frame(card, width=4)
+        stripe.pack(side="left", fill="y")
+        inner = tk.Frame(card, padx=8, pady=5)
+        inner.pack(side="left", fill="both", expand=True)
+        top = tk.Frame(inner)
+        top.pack(fill="x")
+        w = {"card": card, "stripe": stripe, "inner": inner, "top": top,
+             "name": tk.Label(top, font=bold), "when": tk.Label(top, fg=MUTED, font=small),
+             "label": tk.Label(top, font=tiny_bold),
+             "agents": tk.Label(top, fg=STATE_STYLE["working"][1], font=small),
+             "detail": tk.Label(inner, font=font, anchor="w", justify="left", wraplength=width - 40),
+             "task": tk.Label(inner, fg=MUTED, font=small, anchor="w", justify="left", wraplength=width - 40)}
+        w["name"].pack(side="left")
+        w["when"].pack(side="right")
+        w["label"].pack(side="right", padx=6)
+        entry = {"w": w, "s": None}
+        bind_card(card, entry)
+        return entry
+
+    def show(widget, visible, **pack):
+        if visible and not widget.winfo_manager():
+            widget.pack(**pack)
+        elif not visible and widget.winfo_manager():
+            widget.pack_forget()
+
+    def update_card(entry, s, now):
+        entry["s"] = s
+        v, w = card_view(s, now, prefs["quiet_minutes"]), entry["w"]
+        for key in ("card", "inner", "top", "name", "when", "label", "agents", "detail", "task"):
+            w[key].configure(bg=v["bg"])
+        w["stripe"].configure(bg=v["accent"])
+        w["name"].configure(text=v["name"], fg=v["fg"])
+        w["label"].configure(text=v["label"], fg=v["accent"])
+        w["when"].configure(text=card_time(s, now))
+        w["agents"].configure(text=v["agents"])
+        w["detail"].configure(text=v["detail"], fg=v["fg"])
+        w["task"].configure(text=v["task"])
+        show(w["agents"], bool(v["agents"]), side="right")
+        show(w["detail"], bool(v["detail"]), fill="x", after=w["top"])
+        show(w["task"], bool(v["task"]), fill="x")
+
     def render(sessions, now):
-        for child in body.winfo_children():
-            child.destroy()
+        sessions = sessions[:15]
+        ids = [s.get("session_id") for s in sessions]
+        for sid in [k for k in cards if k not in ids]:
+            cards.pop(sid)["w"]["card"].destroy()
+        show(empty, not sessions, fill="x")
+        show(spacer, bool(sessions))
         ui["times"] = []
-        if not sessions:
-            tk.Label(body, text="No Claude Code sessions running", bg=BG, fg=MUTED, font=font, pady=14).pack(fill="x")
-            return
-        for s in sessions[:15]:
-            quiet = is_quiet(s, now, prefs["quiet_minutes"])
-            label, accent = ("QUIET?", MUTED) if quiet else STATE_STYLE.get(s.get("state"), ("?", MUTED))
-            card_bg = CARD_HOT if s.get("state") == "waiting" else CARD
-            text_fg = MUTED if quiet else FG
-            card = tk.Frame(body, bg=card_bg)
-            card.pack(fill="x", padx=6, pady=(6, 0))
-            tk.Frame(card, bg=accent, width=4).pack(side="left", fill="y")
-            inner = tk.Frame(card, bg=card_bg, padx=8, pady=5)
-            inner.pack(side="left", fill="both", expand=True)
-            top = tk.Frame(inner, bg=card_bg)
-            top.pack(fill="x")
-            name = s.get("project") or "?"
-            heading = s.get("custom_title") or s.get("title")
-            if heading:
-                name = f"{name} · {heading}"
-            tk.Label(top, text=name[:44] + ("…" if len(name) > 44 else ""), bg=card_bg, fg=text_fg, font=bold).pack(side="left")
-            when = tk.Label(top, text=card_time(s, now), bg=card_bg, fg=MUTED, font=small)
-            when.pack(side="right")
-            ui["times"].append((when, s))
-            tk.Label(top, text=label, bg=card_bg, fg=accent, font=tiny_bold).pack(side="right", padx=6)
-            agents = subagent_label(s)
-            if agents:
-                tk.Label(top, text=agents, bg=card_bg, fg=STATE_STYLE["working"][1], font=small).pack(side="right")
-            detail = detail_line(s)
-            if detail:
-                tk.Label(inner, text=detail, bg=card_bg, fg=text_fg, font=font, anchor="w", justify="left", wraplength=width - 40).pack(fill="x")
-            if s.get("task"):
-                tk.Label(inner, text="▸ " + s["task"], bg=card_bg, fg=MUTED, font=small, anchor="w", justify="left", wraplength=width - 40).pack(fill="x")
-            bind_card(card, s)
-        tk.Frame(body, bg=BG, height=6).pack()
+        for s in sessions:
+            entry = cards.get(s.get("session_id")) or cards.setdefault(s.get("session_id"), build_card())
+            update_card(entry, s, now)
+            ui["times"].append((entry["w"]["when"], s))
+        order = [cards[sid]["w"]["card"] for sid in ids]
+        if [c for c in body.pack_slaves() if c in order] != order:
+            for card in order:  # re-packing a mapped widget only moves it; it is not unmapped
+                card.pack(fill="x", padx=6, pady=(6, 0), before=spacer)
 
     def alert(waiting, done):
         if waiting:

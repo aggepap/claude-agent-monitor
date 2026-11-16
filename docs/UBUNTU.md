@@ -53,7 +53,8 @@ appears after your first message.
 
 Clicking a card jumps to that session's terminal. On Wayland:
 
-**tmux:** clicking always switches tmux to the session's window and pane. Add this to `~/.tmux.conf`
+**tmux:** clicking selects the session's window and pane in the terminal already showing it; if no
+terminal shows that session, a new terminal window opens attached to it. Add this to `~/.tmux.conf`
 (before the `run '~/.tmux/plugins/tpm/tpm'` line, if you use tpm) so the terminal title shows
 Claude's session title:
 

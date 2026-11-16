@@ -110,7 +110,7 @@ class TmuxTests(unittest.TestCase):
         argv = monitor.tmux_command({"tmux_pane": "%7", "tmux_socket": "/tmp/tmux-1000/default"}, "Ubuntu-22.04")
         self.assertEqual(argv[:5], ["wsl.exe", "-d", "Ubuntu-22.04", "-e", "tmux"])
         self.assertIn("/tmp/tmux-1000/default", argv)
-        for cmd in ("switch-client", "select-window", "select-pane"):
+        for cmd in ("select-window", "select-pane", "if-shell", "switch-client -t %7"):
             self.assertIn(cmd, argv)
         self.assertEqual(argv.count("%7"), 3)
 
@@ -135,6 +135,12 @@ class LinuxTests(unittest.TestCase):
         self.assertEqual(monitor.resolve_sessions_dir([], Path("/home/u")), Path("/home/u/.claude/agent-monitor/sessions"))
         self.assertEqual(monitor.resolve_sessions_dir(["--sessions"], Path("/home/u")), Path("/home/u/.claude/agent-monitor/sessions"))
 
+    def test_tmux_args_only_switches_client_when_session_unattached(self):
+        argv = monitor.tmux_args({"tmux_pane": "%3", "tmux_socket": "/tmp/tmux-1000/default"})
+        self.assertNotIn("switch-client", argv)  # never unconditional: it would hijack another terminal
+        i = argv.index("if-shell")
+        self.assertEqual(argv[i:], ["if-shell", "-F", "-t", "%3", "#{==:#{session_attached},0}", "switch-client -t %3"])
+
     def test_tmux_args_runs_tmux_directly(self):
         argv = monitor.tmux_args({"tmux_pane": "%3", "tmux_socket": "/tmp/tmux-1000/default"})
         self.assertEqual(argv[:3], ["tmux", "-S", "/tmp/tmux-1000/default"])
@@ -153,6 +159,30 @@ class LinuxTests(unittest.TestCase):
         self.assertEqual(argv[0], "gdbus")
         self.assertIn("de.lucaswerkmeister.ActivateWindowByTitle.activateBySubstring", argv)
         self.assertEqual(argv[-1], "Fix checkout bug")
+
+    def test_linux_tmux_session_never_matches_by_project_name(self):
+        tmux = {"title": "Fix login", "project": "shop", "tmux_pane": "%3", "tmux_socket": "/tmp/tmux-1000/default"}
+        fields = monitor.linux_match_fields(tmux)
+        self.assertEqual(monitor.title_needles(fields), ["Fix login"])
+        editor = [{"k": 0, "kind": "tab", "hwnd": 1, "name": "app.py - shop - Visual Studio Code"}]
+        self.assertIsNone(monitor.choose_target(fields, editor))
+        self.assertEqual(tmux["project"], "shop")  # caller's session is left untouched
+
+    def test_linux_plain_session_still_matches_by_project_name(self):
+        plain = {"title": "Fix login", "project": "shop"}
+        self.assertEqual(monitor.title_needles(monitor.linux_match_fields(plain)), ["Fix login", "shop"])
+
+    def test_tmux_attach_args_targets_the_pane(self):
+        argv = monitor.tmux_attach_args({"tmux_pane": "%3", "tmux_socket": "/tmp/tmux-1000/default"})
+        self.assertEqual(argv, ["tmux", "-S", "/tmp/tmux-1000/default", "attach-session", "-t", "%3"])
+        self.assertIsNone(monitor.tmux_attach_args({"tmux_pane": "%3;x", "tmux_socket": "/tmp/s"}))
+
+    def test_terminal_command_per_emulator(self):
+        a = ["tmux", "attach-session", "-t", "%3"]
+        self.assertEqual(monitor.terminal_command("/usr/bin/ptyxis", a), ["/usr/bin/ptyxis", "--new-window", "--", *a])
+        self.assertEqual(monitor.terminal_command("/usr/bin/gnome-terminal", a), ["/usr/bin/gnome-terminal", "--", *a])
+        self.assertEqual(monitor.terminal_command("/usr/bin/xterm", a), ["/usr/bin/xterm", "-e", *a])
+        self.assertIsNone(monitor.terminal_command(None, a))
 
     def test_title_needles_order(self):
         self.assertEqual(monitor.title_needles({"custom_title": "c", "title": "t", "project": "shop"}), ["c", "t", "shop"])
